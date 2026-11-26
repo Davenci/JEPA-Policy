@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 
 from jepa_policy.agent import TrainingAgent
 from jepa_policy.config import (
@@ -24,6 +24,7 @@ from jepa_policy.config import (
     OptimizationConfig,
     TaskConfig,
 )
+from jepa_policy.datasets.icedtea_cache import CachedIcedTeaDataset, build_icedtea_cache
 from jepa_policy.datasets.icedtea_dataset import (
     ACTION_NAMES,
     CAMERAS,
@@ -34,10 +35,9 @@ from jepa_policy.datasets.icedtea_dataset import (
 from jepa_policy.torch_utils import set_seed
 
 DATASET_PATH = (
-    "/home/x1/work/X1_Pro_data/waterbar_datasets/train/merged/"
-    "CeMAT_12task_2160eps_20261024_smoothed"
+    "/mnt/data/EIC01/vla/x1_pro/train/waterbar_2task_228eps_20261126_smoothed"
 )
-OUTPUT_PATH = Path("/home/x1/work/yuanyh/JEPA-Policy/outputs")
+OUTPUT_PATH = Path("./outputs")
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,32 @@ class TrainingRunOptions:
     output_path: Path
     save_every: int
     resume_checkpoint: Path | None
+
+
+class ContinuousShuffleBatchSampler(Sampler[list[int]]):
+    def __init__(self, dataset_size: int, batch_size: int, total_batches: int):
+        if dataset_size < batch_size or batch_size <= 0 or total_batches <= 0:
+            raise ValueError(
+                "dataset_size must fit one batch; batch_size and total_batches must be positive"
+            )
+        self.dataset_size = dataset_size
+        self.batch_size = batch_size
+        self.total_batches = total_batches
+        self.batches_per_epoch = dataset_size // batch_size
+
+    def __iter__(self):
+        yielded = 0
+        while yielded < self.total_batches:
+            indices = torch.randperm(self.dataset_size).tolist()
+            for batch_index in range(self.batches_per_epoch):
+                start = batch_index * self.batch_size
+                yield indices[start : start + self.batch_size]
+                yielded += 1
+                if yielded == self.total_batches:
+                    return
+
+    def __len__(self) -> int:
+        return self.total_batches
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -59,8 +85,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=100000)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--workers", type=int, default=8)
-    parser.add_argument("--save-every", type=int, default=2000)
+    parser.add_argument("--save-every", type=int, default=5000)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument(
+        "--cache-root", type=Path, default=Path("/tmp/jepa_icedtea_cache")
+    )
+    parser.add_argument("--cache-build-workers", type=int, default=4)
     parser.add_argument("--device", default="cuda:0")
     return parser.parse_args()
 
@@ -192,17 +222,20 @@ def move_to_device(value, device: torch.device):
 
 def create_dataloader(dataset: IcedTeaDataset, config: Config) -> DataLoader:
     workers = config.optimization.dataloader_num_workers
+    batch_sampler = ContinuousShuffleBatchSampler(
+        len(dataset),
+        config.optimization.batch_size,
+        config.optimization.gradient_steps,
+    )
     loader = DataLoader(
         dataset,
-        batch_size=config.optimization.batch_size,
-        shuffle=True,
+        batch_sampler=batch_sampler,
         num_workers=workers,
         pin_memory=True,
         persistent_workers=workers > 0,
         worker_init_fn=initialize_icedtea_worker if workers > 0 else None,
         multiprocessing_context="spawn" if workers > 0 else None,
         prefetch_factor=1 if workers > 0 else None,
-        drop_last=True,
     )
     if len(loader) == 0:
         raise ValueError("Dataset has fewer samples than the batch size")
@@ -336,6 +369,7 @@ def main() -> None:
         or args.batch_size <= 0
         or args.workers < 0
         or args.save_every < 0
+        or args.cache_build_workers <= 0
     ):
         raise ValueError(
             "steps/batch-size must be positive; workers/save-every nonnegative"
@@ -358,8 +392,13 @@ def main() -> None:
         f"Task={dataset.root} / iced tea; samples={len(dataset)}; actions={ACTION_NAMES}",
         flush=True,
     )
+    cache_reader = build_icedtea_cache(
+        dataset, args.cache_root, cache_build_workers=args.cache_build_workers
+    )
+    cached_dataset = CachedIcedTeaDataset(dataset, cache_reader)
+    print(f"Training from decoded cache; samples={len(cached_dataset)}", flush=True)
     options = TrainingRunOptions(args.output, args.save_every, args.resume)
-    train(config, dataset, options)
+    train(config, cached_dataset, options)
 
 
 if __name__ == "__main__":
