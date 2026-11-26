@@ -320,14 +320,12 @@ def train(config: Config, dataset: IcedTeaDataset, options: TrainingRunOptions) 
                 flush=True,
             )
         if options.save_every > 0 and (step + 1) % options.save_every == 0:
-            agent.save(
-                model_dir / "model_latest.pt", training_state={"n_gradient_step": step}
-            )
+            checkpoint_path = model_dir / f"model_step_{step + 1:06d}.pt"
+            agent.save(checkpoint_path, training_state={"n_gradient_step": step})
     final_step = config.optimization.gradient_steps - 1
-    agent.save(
-        model_dir / "model_latest.pt", training_state={"n_gradient_step": final_step}
-    )
-    print(f"Training complete; checkpoint: {model_dir / 'model_latest.pt'}", flush=True)
+    checkpoint_path = model_dir / f"model_step_{final_step + 1:06d}.pt"
+    agent.save(checkpoint_path, training_state={"n_gradient_step": final_step})
+    print(f"Training complete; checkpoint: {checkpoint_path}", flush=True)
 
 
 def main() -> None:
