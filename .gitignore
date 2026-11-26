@@ -67,3 +67,4 @@ venv/
 .DS_Store?
 ._*
 Thumbs.db
+tools/model_eval/

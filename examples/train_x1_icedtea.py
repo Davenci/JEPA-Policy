@@ -7,7 +7,9 @@ import faulthandler
 import json
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -35,7 +37,7 @@ DATASET_PATH = (
     "/home/x1/work/X1_Pro_data/waterbar_datasets/train/merged/"
     "CeMAT_12task_2160eps_20261024_smoothed"
 )
-OUTPUT_PATH = "./outputs/202611261556"
+OUTPUT_PATH = Path("/home/x1/work/yuanyh/JEPA-Policy/outputs")
 
 
 @dataclass(frozen=True)
@@ -48,7 +50,12 @@ class TrainingRunOptions:
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, default=DATASET_PATH)
-    parser.add_argument("--output", type=Path, default=OUTPUT_PATH)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=OUTPUT_PATH
+        / datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d_%H%M%S"),
+    )
     parser.add_argument("--steps", type=int, default=100000)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--workers", type=int, default=8)
