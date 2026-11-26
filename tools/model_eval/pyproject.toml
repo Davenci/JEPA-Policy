@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trajectory-model-eval"
+version = "0.2.0"
+description = "整回合轨迹对比图（逐维子图 + 信息头，自包含）"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "matplotlib>=3.7"]
+
+[project.optional-dependencies]
+# 重新生成测试图/跑测试用；纯绘图不需要
+test = ["pillow>=9.0"]
+
+[project.scripts]
+model-eval = "model_eval.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["model_eval*"]

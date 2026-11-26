@@ -1,0 +1,12 @@
+# 运行时依赖：仅绘图
+numpy>=1.24
+matplotlib>=3.7
+
+# 中文字体（非 pip 包，系统级安装其一即可）：
+#   sudo apt install fonts-noto-cjk        # Noto Sans CJK SC/JP
+#   sudo apt install fonts-wqy-zenhei      # WenQuanYi Zen Hei
+# 注意：不要优先使用 fonts-droid-fallback —— 它只有中日韩字形、
+#       不含拉丁字母，会让 matplotlib 逐字符递归回退并刷大量警告。
+
+# 测试额外需要（可选）：
+#   pip install -e ".[test]"   -> pillow>=9.0

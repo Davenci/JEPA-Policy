@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+model_eval_out/
+
+# 测试产物（模拟数据 + 出图），可随时删除重生成
+port_test/
+port_test_multi/
+# 打包产物
+*.egg-info/
+build/
+dist/

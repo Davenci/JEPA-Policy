@@ -64,8 +64,10 @@ class IcedTeaDataset(Dataset):
         rows = pq.read_table(self.root / "meta/tasks.parquet").to_pylist()
         matches = [row["task_index"] for row in rows if row["task"] == self.task_name]
         if len(matches) != 1:
+            available_tasks = sorted({row["task"] for row in rows})
             raise ValueError(
-                f"Expected one task {self.task_name!r}, found {len(matches)}"
+                f"Expected one task {self.task_name!r}, found {len(matches)}. "
+                f"Available tasks in {self.root / 'meta/tasks.parquet'}: {available_tasks}"
             )
         return int(matches[0])
 
