@@ -3,6 +3,7 @@
 import hashlib
 import json
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -78,6 +79,28 @@ class RawEpisodeSource:
             "action": torch.from_numpy(self.raw_actions[index : index + 10].copy()),
             "future_obs": future,
         }
+
+
+class MultipleEpisodeSource(RawEpisodeSource):
+    def __init__(self, root, episode_count):
+        super().__init__(root)
+        self.episodes = {
+            index + 1: {
+                "dataset_from_index": index * 12,
+                "dataset_to_index": (index + 1) * 12,
+            }
+            for index in range(episode_count)
+        }
+        self.raw_actions = np.tile(self.raw_actions, (episode_count, 1))
+        self.raw_states = np.tile(self.raw_states, (episode_count, 1))
+        self.raw_actions[-12:] += 1000
+
+    def __len__(self):
+        return len(self.episodes) * 3
+
+    def __getitem__(self, index):
+        episode, offset = divmod(index, 3)
+        return super().__getitem__(episode * 12 + offset)
 
 
 def make_agent():
@@ -276,3 +299,48 @@ def test_evaluation_rejects_statistics_file_different_from_training(context):
     path.write_text(json.dumps(statistics))
     with pytest.raises(ValueError, match="normalization differs"):
         evaluator.evaluate(agent, checkpoint, 1)
+
+
+@pytest.mark.parametrize("episode_count", [1, 2, 3, 10])
+def test_all_episodes_contribute_to_metrics_but_only_first_three_are_plotted(
+    context, monkeypatch, episode_count
+):
+    agent, previous, checkpoint = context
+    source = MultipleEpisodeSource(checkpoint.parent, episode_count)
+    evaluator = entry.CheckpointEvaluator(
+        agent.config, (previous.training, source), previous.options
+    )
+    rendered = []
+    monkeypatch.setattr(
+        entry,
+        "render_episode",
+        lambda path, *args, **kwargs: rendered.append(Path(path).stem),
+    )
+    metrics = evaluator.evaluate(agent, checkpoint, 1)
+    output = checkpoint.parent / (checkpoint.stem + "_eval")
+    artifacts = sorted((output / "artifacts").glob("*.npz"))
+    assert len(artifacts) == episode_count
+    assert metrics["episodes"] == episode_count
+    assert metrics["frames"] == episode_count * 12
+    assert metrics["windows"] == episode_count * 3
+    plotted = [f"episode_{index:06d}" for index in range(1, min(episode_count, 3) + 1)]
+    assert rendered == [episode for episode in plotted for _ in range(2)]
+    metadata = json.loads((output / "metrics.json").read_text())
+    assert metadata["plotted_episode_ids"] == plotted
+    assert metadata["evaluation_episode_indices"] == list(range(1, episode_count + 1))
+    squared_errors = []
+    for path in artifacts:
+        with np.load(path) as artifact:
+            squared_errors.append(
+                np.square(
+                    artifact["prediction"].astype(np.float64)
+                    - artifact["ground_truth"].astype(np.float64)
+                )
+            )
+    expected = np.concatenate(squared_errors).mean(axis=0)
+    assert metrics["joint_mse_sum"] == pytest.approx(expected[:7].sum())
+    assert metrics["gripper_mse"] == pytest.approx(expected[7])
+    if episode_count > 3:
+        assert (
+            metrics["gripper_mse"] > np.concatenate(squared_errors[:3]).mean(axis=0)[7]
+        )

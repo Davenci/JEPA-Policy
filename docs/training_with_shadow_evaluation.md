@@ -29,7 +29,7 @@
 1. 完成当前优化器更新，保存权重与优化器状态。
 2. 从这个刚保存的文件读取 EMA 编码器和策略权重，建立独立评估副本。
 3. 对全部留出窗口计算与训练同公式的 MIP 损失。
-4. 对全部留出回合做影子推理，保存原始逐帧预测与轨迹图片。
+4. 对全部留出回合做影子推理，保存全部原始逐帧预测；仅绘制回合索引升序前 3 个回合的轨迹图片，不足 3 个则全部绘制。
 5. 保存标量指标，更新训练/评估曲线，在同一个 MLflow Run 记录当前优化器步数。
 6. 释放评估副本，继续训练。
 
@@ -80,7 +80,9 @@
       figures/episode_000004_delta.png
 ```
 
-轨迹图片及原始点保存在对应权重旁。根目录 `loss_curve.png` 上半部叠加训练与验证 MIP，下半部连接影子动作 MSE。评估记录包含训练统计量文件 SHA256、相关代码 SHA256 和回合索引。
+轨迹图片及原始点保存在对应权重旁。全部留出回合参与 MIP loss 和影子误差汇总，绘图数量限制不截断评估范围；独立评估入口也只绘制前 3 个回合。评估记录列出实际绘图回合。根目录 `loss_curve.png` 上半部叠加训练与验证 MIP，下半部连接影子动作 MSE。评估记录包含训练统计量文件 SHA256、相关代码 SHA256 和回合索引。
+
+独立评估的 `--max-episodes` 仍限制实际评估数量，不能用于仅限制绘图；希望全量统计时省略它即可。绘图限制回归的 54 项相关测试通过，覆盖 1、2、3、10 回合，并确认未绘图回合的较大误差仍计入总体。
 
 ## MLflow 安装与连接
 
@@ -144,16 +146,18 @@ cd /mnt/data/usr/yuanyh/new_test && python3 examples/train_x1_icedtea.py \
 | 文件 | 行数 |
 | --- | ---: |
 | `examples/train_x1_icedtea.py` | 434 |
-| `jepa_policy/checkpoint_evaluation.py` | 314 |
+| `examples/evaluate_x1_icedtea.py` | 435 |
+| `jepa_policy/checkpoint_evaluation.py` | 320 |
 | `jepa_policy/datasets/icedtea_split.py` | 177 |
 | `jepa_policy/icedtea_training_arguments.py` | 78 |
 | `jepa_policy/mlflow_tracking.py` | 222 |
 | `jepa_policy/training_artifacts.py` | 85 |
 | `jepa_policy/training_logging.py` | 133 |
-| `jepa_policy/training_monitor.py` | 177 |
+| `jepa_policy/training_monitor.py` | 179 |
 | `jepa_policy/training_startup.py` | 360 |
 | `tests/test_check_icedtea_mlflow.py` | 134 |
-| `tests/test_checkpoint_evaluation.py` | 278 |
+| `tests/test_checkpoint_evaluation.py` | 346 |
+| `tests/test_evaluation_plot_limit.py` | 112 |
 | `tests/test_icedtea_startup_log.py` | 452 |
 | `tests/test_icedtea_training_split.py` | 207 |
 | `tests/test_mlflow_tracking.py` | 217 |

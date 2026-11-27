@@ -25,6 +25,8 @@ from tools.model_eval.model_eval import (
     render_episode,
 )
 
+max_plot_episodes = 3
+
 
 @dataclass(frozen=True)
 class CheckpointEvaluationOptions:
@@ -221,7 +223,7 @@ class CheckpointEvaluator:
         }
 
     def save_figures(self, results, output: Path, checkpoint_path: Path):
-        for result in results:
+        for result in results[:max_plot_episodes]:
             for kind in ("abs", "delta"):
                 render_episode(
                     result["path"],
@@ -303,6 +305,10 @@ class CheckpointEvaluator:
             "source_hashes": self.source_hashes(),
             "evaluation_episode_indices": sorted(self.source.episodes),
             "training_episode_indices": sorted(self.training.episodes),
+            "max_plot_episodes": max_plot_episodes,
+            "plotted_episode_ids": [
+                result["episode_id"] for result in results[:max_plot_episodes]
+            ],
             "chunk_size": self.options.chunk_size,
             "temporal_ensemble": False,
             "seed": self.options.seed,

@@ -9,6 +9,7 @@ from pathlib import Path
 from jepa_policy.checkpoint_evaluation import (
     CheckpointEvaluationOptions,
     CheckpointEvaluator,
+    max_plot_episodes,
 )
 from jepa_policy.mlflow_tracking import MlflowOptions, TrainingTracker
 from jepa_policy.training_logging import log_section, save_training_checkpoint
@@ -145,7 +146,7 @@ class TrainingMonitor:
                 "评估 loss 复用训练 MIP；另记真实影子推理动作 MSE；不按任务文本筛选",
                 f"MLflow={self.options.mlflow.enabled} | 实验={self.options.mlflow.experiment_name}",
                 f"评估 batch={self.options.evaluation_batch_size} | 执行步数={self.options.evaluation_chunk_size}",
-                "权重旁保存逐帧预测及轨迹图；根目录保存 evaluation_metrics.jsonl 和 loss_curve.png",
+                "权重旁保存全部逐帧预测，仅绘制前3回合；根目录保存 evaluation_metrics.jsonl 和 loss_curve.png",
             ],
         )
         return self
@@ -169,6 +170,7 @@ class TrainingMonitor:
         log_section(
             "权重影子评估完成",
             [
+                f"评估回合={metrics['episodes']}（全部参与统计） | 绘图回合={min(metrics['episodes'], max_plot_episodes)}",
                 f"step={step + 1} | MIP loss={metrics['loss']:.6f} | 动作 MSE={metrics['shadow_action_mse']:.6f}",
                 f"七关节 MSE 之和={metrics['joint_mse_sum']:.8f} | 夹爪 MSE={metrics['gripper_mse']:.8f}",
                 f"评估输出={path.parent / (path.stem + '_eval')}",

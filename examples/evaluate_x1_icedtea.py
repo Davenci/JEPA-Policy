@@ -38,6 +38,7 @@ CHECKPOINT: Path | None = None
 TRAINING_STATS: dict | None = None
 DEVICE = "cuda:0"
 test_episode_indices: tuple[int, ...] | None = None
+max_plot_episodes = 3
 
 
 @dataclass(frozen=True)
@@ -347,6 +348,9 @@ def write_evaluation_config(
         "checkpoint": str(CHECKPOINT.resolve()),
         "dataset": str(TEST_DATASET.resolve()),
         "episode_ids": [episode.episode_id for episode in dataset.episodes],
+        "plotted_episode_ids": [
+            episode.episode_id for episode in dataset.episodes[:max_plot_episodes]
+        ],
         "chunk_size": model.chunk_size,
         "prediction_horizon": model.horizon,
         "action_start": model.action_start,
@@ -408,7 +412,7 @@ def run_evaluation(args) -> Path:
     artifact_dir = output / "artifacts"
     figure_dir = output / "figures"
     results = evaluate(model, dataset, artifact_dir)
-    for result in results:
+    for result in results[:max_plot_episodes]:
         for kind in ("abs", "delta"):
             render_episode(
                 result["path"],
