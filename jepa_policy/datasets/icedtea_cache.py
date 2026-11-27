@@ -33,6 +33,17 @@ CACHE_FIELDS = {
 }
 
 
+def normalization_fingerprint(dataset: IcedTeaDataset) -> dict | None:
+    if not dataset.normalize:
+        return None
+    return {
+        "action_min": dataset.action_min.tolist(),
+        "action_range": dataset.action_range.tolist(),
+        "state_min": dataset.state_min.tolist(),
+        "state_range": dataset.state_range.tolist(),
+    }
+
+
 class IcedTeaSampleSource(SampleSource):
     def __init__(self, config: IcedTeaDatasetConfig):
         self.dataset = IcedTeaDataset(config)
@@ -43,7 +54,10 @@ class IcedTeaSampleSource(SampleSource):
                     "obs_steps": config.obs_steps,
                     "horizon": config.horizon,
                     "future_steps": config.future_steps,
-                    "task": self.dataset.task_name,
+                    "selection_mode": "all_episode_labels",
+                    "episode_indices": config.episode_indices,
+                    "normalize": config.normalize,
+                    "normalization": normalization_fingerprint(self.dataset),
                 },
                 separators=(",", ":"),
             ).encode()
@@ -88,22 +102,24 @@ def build_icedtea_cache(
 ) -> DiskDecodedCacheReader:
     config = {
         "dataset_path": str(dataset.root),
-        "task": dataset.task_name,
+        "selection_mode": "all_episode_labels",
+        "normalize": dataset.normalize,
+        "normalization": normalization_fingerprint(dataset),
         "obs_steps": dataset.obs_steps,
         "horizon": dataset.horizon,
         "future_steps": dataset.future_steps,
         "image_size": dataset.image_size,
         "fields": CACHE_FIELDS,
-        "version": 1,
+        "version": 2,
     }
     dataset_config = IcedTeaDatasetConfig(
         root=dataset.root,
         obs_steps=dataset.obs_steps,
         horizon=dataset.horizon,
         future_steps=dataset.future_steps,
-        task_name=dataset.task_name,
         image_size=dataset.image_size,
         image_interpolation=dataset.image_interpolation,
+        normalize=dataset.normalize,
         episode_indices=dataset.selected_episode_indices,
     )
     config["episode_indices"] = dataset.selected_episode_indices

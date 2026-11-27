@@ -6,7 +6,9 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "rolling_cache"))
@@ -14,7 +16,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "model_ev
 
 import cv2
 import numpy as np
-import pyarrow.parquet as pq
 import torch
 from model_eval import Dataset, Episode, evaluate, render_episode
 
@@ -34,7 +35,6 @@ TEST_DATASET: Path | None = None
 CHECKPOINT: Path | None = None
 TRAINING_STATS: dict | None = None
 DEVICE = "cuda:0"
-TEST_TASK_NAME: str | None = None
 test_episode_indices: tuple[int, ...] | None = None
 
 
@@ -51,30 +51,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--max-episodes", type=int)
     parser.add_argument("--episode-indices", type=Path)
-    parser.add_argument("--task-name")
     parser.add_argument("--device", default="cuda:0")
     return parser.parse_args()
-
-
-def resolve_task_name(
-    dataset_path: Path, trained_task: str, requested_task: str | None
-) -> str:
-    rows = pq.read_table(dataset_path / "meta/tasks.parquet").to_pylist()
-    available_tasks = sorted({row["task"] for row in rows})
-    if requested_task:
-        if requested_task not in available_tasks:
-            raise ValueError(
-                f"Task {requested_task!r} is not present. Available tasks: {available_tasks}"
-            )
-        return requested_task
-    if trained_task in available_tasks:
-        return trained_task
-    if len(available_tasks) == 1:
-        return available_tasks[0]
-    raise ValueError(
-        f"Cannot infer task from checkpoint metadata. Available tasks: {available_tasks}. "
-        "Pass --task-name to select one."
-    )
 
 
 def configure(args) -> None:
@@ -84,7 +62,6 @@ def configure(args) -> None:
         CHECKPOINT, \
         TRAINING_STATS, \
         DEVICE, \
-        TEST_TASK_NAME, \
         test_episode_indices
 
     TEST_DATASET = Path(getattr(args, "dataset", None) or args.data_root)
@@ -112,12 +89,6 @@ def configure(args) -> None:
             "Evaluation image resize interpolation differs from the training "
             f"pipeline: {interpolation} != INTER_LINEAR ({cv2.INTER_LINEAR})"
         )
-    TEST_TASK_NAME = resolve_task_name(
-        TEST_DATASET,
-        TRAINING_STATS["task"],
-        getattr(args, "task_name", None),
-    )
-    print(f"Task: {TEST_TASK_NAME}", flush=True)
 
 
 def restore_raw_actions(source: IcedTeaDataset) -> np.ndarray:
@@ -175,22 +146,16 @@ def create_episode(
         length=episode_length,
         ground_truth=frame_data.actions_raw[start:end],
         observe=observe,
-        prompt=TEST_TASK_NAME or "",
+        prompt="",
     )
 
 
 def build_dataset() -> Dataset:
-    if (
-        TRAIN_OUTPUT is None
-        or TEST_DATASET is None
-        or TEST_TASK_NAME is None
-        or TRAINING_STATS is None
-    ):
+    if TRAIN_OUTPUT is None or TEST_DATASET is None or TRAINING_STATS is None:
         raise RuntimeError("Configure the evaluation paths before loading the dataset")
     source = IcedTeaDataset(
         IcedTeaDatasetConfig(
             TEST_DATASET,
-            task_name=TEST_TASK_NAME,
             image_interpolation=TRAINING_STATS["image_preprocessing"][
                 "resize_interpolation"
             ],
@@ -205,10 +170,9 @@ def build_dataset() -> Dataset:
     episodes = [
         create_episode(source, episode_id, record, frame_data)
         for episode_id, record in sorted(source.episodes.items())
-        if TEST_TASK_NAME in record["tasks"]
     ]
     if not episodes:
-        raise ValueError(f"No episodes found for task {TEST_TASK_NAME!r}")
+        raise ValueError(f"No episodes found in {TEST_DATASET}")
     return Dataset(episodes, name=str(TEST_DATASET))
 
 
@@ -278,10 +242,12 @@ def run_evaluation(args) -> Path:
 
     if args.output is None:
         output = (
-            CHECKPOINT.parent.parent
-            / "evaluation"
-            / (f"{CHECKPOINT.stem}_{TEST_DATASET.name}")
+            Path(__file__).resolve().parents[1]
+            / "output"
+            / "eval"
+            / datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d_%H%M")
         )
+        output.mkdir(parents=True, exist_ok=False)
     else:
         output = args.output
     artifact_dir = output / "artifacts"

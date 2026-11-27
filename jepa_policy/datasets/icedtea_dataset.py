@@ -1,4 +1,4 @@
-"""LeRobot v3 reader for one X1 task and right-arm joint actions."""
+"""LeRobot v3 reader for selected X1 episodes and right-arm joint actions."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
 
-TASK_NAME = "grasp the red iced tea."
 CAMERAS = {
     "head_image": "observation.images.head",
     "left_wrist_image": "observation.images.left_wrist",
@@ -31,7 +30,6 @@ class IcedTeaDatasetConfig:
     obs_steps: int = 2
     horizon: int = 10
     future_steps: int = 4
-    task_name: str = TASK_NAME
     image_size: int = 128
     image_interpolation: int = cv2.INTER_LINEAR
     normalize: bool = True
@@ -45,37 +43,24 @@ def initialize_icedtea_worker(worker_id: int) -> None:
 
 
 class IcedTeaDataset(Dataset):
-    """Read image and 8D action windows from one local LeRobot v3 task."""
+    """Read image and 8D action windows without filtering task labels."""
 
     def __init__(self, config: IcedTeaDatasetConfig):
         self.root = Path(config.root)
         self.obs_steps = config.obs_steps
         self.horizon = config.horizon
         self.future_steps = config.future_steps
-        self.task_name = config.task_name
         self.image_size = config.image_size
         self.image_interpolation = config.image_interpolation
         self.normalize = config.normalize
         self.selected_episode_indices = config.episode_indices
-        self.task_index = self.find_task_index()
         self.episodes = self.load_episodes()
         self.load_frames()
         self.containers = OrderedDict()
         self.frame_cache = OrderedDict()
         self.samples = self.make_sample_indices()
         if not self.samples:
-            raise ValueError(f"No valid windows for {self.task_name!r} in {self.root}")
-
-    def find_task_index(self) -> int:
-        rows = pq.read_table(self.root / "meta/tasks.parquet").to_pylist()
-        matches = [row["task_index"] for row in rows if row["task"] == self.task_name]
-        if len(matches) != 1:
-            available_tasks = sorted({row["task"] for row in rows})
-            raise ValueError(
-                f"Expected one task {self.task_name!r}, found {len(matches)}. "
-                f"Available tasks in {self.root / 'meta/tasks.parquet'}: {available_tasks}"
-            )
-        return int(matches[0])
+            raise ValueError(f"No valid windows in selected episodes of {self.root}")
 
     def load_frames(self) -> None:
         info = json.loads((self.root / "meta/info.json").read_text())
@@ -106,16 +91,14 @@ class IcedTeaDataset(Dataset):
             self.states = self.raw_states.copy()
 
     def normalize_frames(self) -> None:
-        task_mask = (self.task_indices == self.task_index) & np.isin(
-            self.episode_ids, tuple(self.episodes)
-        )
-        self.action_min = self.actions[task_mask].min(axis=0)
+        selected_mask = np.isin(self.episode_ids, tuple(self.episodes))
+        self.action_min = self.actions[selected_mask].min(axis=0)
         self.action_range = np.maximum(
-            self.actions[task_mask].max(axis=0) - self.action_min, 1e-6
+            self.actions[selected_mask].max(axis=0) - self.action_min, 1e-6
         )
-        self.state_min = self.states[task_mask].min(axis=0)
+        self.state_min = self.states[selected_mask].min(axis=0)
         self.state_range = np.maximum(
-            self.states[task_mask].max(axis=0) - self.state_min, 1e-6
+            self.states[selected_mask].max(axis=0) - self.state_min, 1e-6
         )
         self.actions = (self.actions - self.action_min) / self.action_range * 2.0 - 1.0
         self.states = (self.states - self.state_min) / self.state_range * 2.0 - 1.0
@@ -136,15 +119,6 @@ class IcedTeaDataset(Dataset):
         missing_ids = sorted(selected_ids - episodes.keys())
         if missing_ids:
             raise ValueError(f"Episode indices not found in dataset: {missing_ids}")
-        wrong_task_ids = [
-            episode_id
-            for episode_id in self.selected_episode_indices
-            if self.task_name not in episodes[episode_id]["tasks"]
-        ]
-        if wrong_task_ids:
-            raise ValueError(
-                f"Episodes do not contain task {self.task_name!r}: {wrong_task_ids}"
-            )
         return {
             episode_id: episodes[episode_id]
             for episode_id in self.selected_episode_indices
@@ -154,8 +128,6 @@ class IcedTeaDataset(Dataset):
         samples = []
         needed = max(self.horizon, self.obs_steps + self.future_steps)
         for episode_id, episode in self.episodes.items():
-            if self.task_name not in episode["tasks"]:
-                continue
             start = int(episode["dataset_from_index"])
             end = int(episode["dataset_to_index"])
             samples.extend(

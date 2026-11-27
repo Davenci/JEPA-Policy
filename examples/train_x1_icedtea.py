@@ -7,6 +7,7 @@ import faulthandler
 import json
 import sys
 import time
+from contextlib import redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +38,22 @@ from jepa_policy.datasets.icedtea_dataset import (
     initialize_icedtea_worker,
 )
 from jepa_policy.torch_utils import set_seed
+from jepa_policy.training_logging import (
+    CacheLogStream,
+    log_section,
+    log_training_progress,
+    run_logged_training,
+    save_training_checkpoint,
+    setup_training_logging,
+)
+from jepa_policy.training_startup import (
+    build_training_summary,
+    collect_normalization_info,
+    record_cache_info,
+    record_first_batch,
+    record_model_info,
+    write_training_summary,
+)
 
 DATASET_PATH = (
     "/mnt/data/EIC01/vla/x1_pro/train/waterbar_2task_228eps_20261126_smoothed"
@@ -49,6 +66,7 @@ class TrainingRunOptions:
     output_path: Path
     save_every: int
     resume_checkpoint: Path | None
+    log_every: int = 10
 
 
 class ContinuousShuffleBatchSampler(Sampler[list[int]]):
@@ -90,6 +108,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--save-every", type=int, default=5000)
+    parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--episode-indices", type=Path)
     parser.add_argument(
@@ -274,42 +293,28 @@ def prepare_run_directory(
     model_dir = output_path / "models"
     model_dir.mkdir(parents=True, exist_ok=True)
     metadata = {
-        "task": dataset.task_name,
+        "selection_mode": "all_episode_labels",
         "action_names": ACTION_NAMES,
         "action_min": dataset.action_min.tolist(),
         "action_range": dataset.action_range.tolist(),
         "state_min": dataset.state_min.tolist(),
         "state_range": dataset.state_range.tolist(),
         "dataset": str(dataset.root),
-        "episode_indices": sorted({episode_id for _, episode_id in dataset.samples}),
+        "episode_indices": sorted(dataset.episodes),
+        "window_episode_indices": sorted(
+            {episode_id for _, episode_id in dataset.samples}
+        ),
     }
     (output_path / "dataset_metadata.json").write_text(
         json.dumps(metadata, indent=2) + "\n"
     )
-    action_min = dataset.action_min.astype(float)
-    action_range = dataset.action_range.astype(float)
-    state_min = dataset.state_min.astype(float)
-    state_range = dataset.state_range.astype(float)
     normalization_stats = {
         "schema_version": 1,
-        "task": dataset.task_name,
+        "selection_mode": "all_episode_labels",
         "dataset": str(dataset.root),
-        "normalization": "per_task_min_max_to_minus1_plus1",
+        "normalization": "selected_episode_min_max_to_minus1_plus1",
         "episode_indices": metadata["episode_indices"],
-        "features": {
-            "action": {
-                "names": ACTION_NAMES,
-                "min": action_min.tolist(),
-                "max": (action_min + action_range).tolist(),
-                "range": action_range.tolist(),
-            },
-            "observation.state": {
-                "names": ACTION_NAMES,
-                "min": state_min.tolist(),
-                "max": (state_min + state_range).tolist(),
-                "range": state_range.tolist(),
-            },
-        },
+        "features": collect_normalization_info(dataset, output_path)["features"],
         "image_preprocessing": {
             "source_pixel_type": "uint8_rgb",
             "resize_shape": [dataset.image_size, dataset.image_size],
@@ -371,13 +376,17 @@ def train(config: Config, dataset: IcedTeaDataset, options: TrainingRunOptions) 
     model_dir, metrics_path = prepare_run_directory(
         options.output_path, dataset, options.resume_checkpoint
     )
+    record_model_info(agent, options.output_path, start_step)
+    log_section("数据加载器启动", ["正在初始化工作进程并预取首批数据"])
     iterator = iter(loader)
     agent.train()
     for step in range(start_step, config.optimization.gradient_steps):
-        started = time.perf_counter()
-        data_started = time.perf_counter()
+        step_started = time.perf_counter()
+        data_started = step_started
         batch, iterator = next_batch(iterator, loader)
         data_wait = time.perf_counter() - data_started
+        if step == start_step:
+            record_first_batch(batch, options.output_path)
         update_started = time.perf_counter()
         metrics = update_agent(agent, config, batch)
         update_time = time.perf_counter() - update_started
@@ -388,43 +397,17 @@ def train(config: Config, dataset: IcedTeaDataset, options: TrainingRunOptions) 
         record = log_training_step(
             metrics_path, metrics, step, scheduler.get_last_lr()[0]
         )
-        if (step + 1) % 10 == 0 or step == start_step:
-            elapsed = time.perf_counter() - started
-            print(
-                f"step={step + 1} loss={record['loss']:.6f} "
-                f"data={data_wait:.2f}s update={update_time:.2f}s "
-                f"elapsed={elapsed:.2f}s gpu_peak={record['gpu_peak_memory_gib']:.1f}GiB",
-                flush=True,
-            )
+        if (step + 1) % options.log_every == 0 or step == start_step:
+            log_training_progress(record, time.perf_counter() - step_started)
         if options.save_every > 0 and (step + 1) % options.save_every == 0:
-            checkpoint_path = model_dir / f"model_step_{step + 1:06d}.pt"
-            agent.save(checkpoint_path, training_state={"n_gradient_step": step})
+            save_training_checkpoint(agent, model_dir, step)
     final_step = config.optimization.gradient_steps - 1
-    checkpoint_path = model_dir / f"model_step_{final_step + 1:06d}.pt"
-    agent.save(checkpoint_path, training_state={"n_gradient_step": final_step})
-    print(f"Training complete; checkpoint: {checkpoint_path}", flush=True)
+    checkpoint_path = save_training_checkpoint(agent, model_dir, final_step)
+    log_section("训练完成", [f"最终权重={checkpoint_path}"])
 
 
-def main() -> None:
-    faulthandler.enable(all_threads=True)
-    args = parse_arguments()
-    if (
-        args.steps <= 0
-        or args.batch_size <= 0
-        or args.workers < 0
-        or args.save_every < 0
-        or args.cache_build_workers <= 0
-    ):
-        raise ValueError(
-            "steps/batch-size must be positive; workers/save-every nonnegative"
-        )
-    if args.device != "cuda:0" or not torch.cuda.is_available():
-        raise RuntimeError("Training requires one available CUDA device at cuda:0")
-    set_seed(0)
-    optimization = create_optimization_config(args.steps, args.batch_size, args.workers)
-    config = create_config(args.dataset, args.output, optimization)
-    config.optimization.device = args.device
-    dataset = IcedTeaDataset(
+def load_training_dataset(args, config: Config) -> IcedTeaDataset:
+    return IcedTeaDataset(
         IcedTeaDatasetConfig(
             args.dataset,
             obs_steps=config.task.obs_steps,
@@ -437,18 +420,56 @@ def main() -> None:
             ),
         )
     )
-    print(
-        f"Task={dataset.root} / iced tea; samples={len(dataset)}; actions={ACTION_NAMES}",
-        flush=True,
+
+
+def main() -> None:
+    faulthandler.enable(all_threads=True)
+    args = parse_arguments()
+    setup_training_logging(args.output)
+    if (
+        args.steps <= 0
+        or args.batch_size <= 0
+        or args.workers < 0
+        or args.save_every < 0
+        or args.cache_build_workers <= 0
+        or args.log_every <= 0
+    ):
+        raise ValueError(
+            "steps/batch-size/log-every must be positive; workers/save-every nonnegative"
+        )
+    if args.device != "cuda:0" or not torch.cuda.is_available():
+        raise RuntimeError("Training requires one available CUDA device at cuda:0")
+    # 固定随机种子，建立统一日志，再核对训练数据与配置。
+    log_section(
+        "读取训练数据", [f"数据集={args.dataset}", f"索引文件={args.episode_indices}"]
     )
-    cache_reader = build_icedtea_cache(
-        dataset, args.cache_root, cache_build_workers=args.cache_build_workers
+    set_seed(0)
+    optimization = create_optimization_config(args.steps, args.batch_size, args.workers)
+    config = create_config(args.dataset, args.output, optimization)
+    config.optimization.device = args.device
+    dataset = load_training_dataset(args, config)
+    write_training_summary(build_training_summary(config, dataset, args), args.output)
+    # 读取或构建与回合索引一致的缓存，并记录实际缓存身份。
+    log_section(
+        "缓存准备",
+        [
+            f"根目录={args.cache_root} | 构建进程={args.cache_build_workers}",
+            "先校验缓存样本映射，再决定复用或构建",
+        ],
     )
+    cache_started = time.perf_counter()
+    with redirect_stdout(CacheLogStream()):
+        cache_reader = build_icedtea_cache(
+            dataset, args.cache_root, cache_build_workers=args.cache_build_workers
+        )
+    record_cache_info(cache_reader, args.output, time.perf_counter() - cache_started)
     cached_dataset = CachedIcedTeaDataset(dataset, cache_reader)
-    print(f"Training from decoded cache; samples={len(cached_dataset)}", flush=True)
-    options = TrainingRunOptions(args.output, args.save_every, args.resume)
+    # 使用固定训练计划更新模型，按配置间隔记录进度与权重。
+    options = TrainingRunOptions(
+        args.output, args.save_every, args.resume, args.log_every
+    )
     train(config, cached_dataset, options)
 
 
 if __name__ == "__main__":
-    main()
+    run_logged_training(main)
