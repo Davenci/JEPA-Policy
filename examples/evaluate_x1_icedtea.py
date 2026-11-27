@@ -51,6 +51,13 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--max-episodes", type=int)
     parser.add_argument("--episode-indices", type=Path)
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        choices=range(1, 10),
+        default=4,
+        help="Actions executed before the next inference; prediction horizon stays 10",
+    )
     parser.add_argument("--device", default="cuda:0")
     return parser.parse_args()
 
@@ -179,9 +186,7 @@ def build_dataset() -> Dataset:
 class IcedTeaPolicy:
     """Wrap the trained policy in model_eval's chunk prediction interface."""
 
-    chunk_size = 8
-
-    def __init__(self):
+    def __init__(self, chunk_size: int = 4):
         if (
             TRAIN_OUTPUT is None
             or TEST_DATASET is None
@@ -196,6 +201,12 @@ class IcedTeaPolicy:
         optimization = create_optimization_config(steps=1, batch_size=1, workers=0)
         config = create_config(TEST_DATASET, TRAIN_OUTPUT, optimization)
         config.optimization.device = DEVICE
+        self.horizon = config.task.horizon
+        self.action_start = config.task.obs_steps - 1
+        max_chunk_size = self.horizon - self.action_start
+        if not 1 <= chunk_size <= max_chunk_size:
+            raise ValueError(f"chunk-size must be between 1 and {max_chunk_size}")
+        self.chunk_size = chunk_size
         action_stats = TRAINING_STATS["features"]["action"]
         self.action_min = torch.as_tensor(action_stats["min"], device=DEVICE)
         self.action_range = torch.as_tensor(action_stats["range"], device=DEVICE)
@@ -212,7 +223,7 @@ class IcedTeaPolicy:
             else:
                 value = value.float()
             inputs[key] = value
-        initial_action = torch.zeros((1, 10, 8), device=DEVICE)
+        initial_action = torch.zeros((1, self.horizon, 8), device=DEVICE)
         with torch.inference_mode():
             normalized, _ = self.agent.sample(
                 act_0=initial_action,
@@ -221,13 +232,15 @@ class IcedTeaPolicy:
                 use_ema=True,
                 return_future=True,
             )
-        executed_chunk = normalized[0, 1:9]
+        executed_chunk = normalized[
+            0, self.action_start : self.action_start + self.chunk_size
+        ]
         actions = (executed_chunk + 1.0) * self.action_range / 2.0 + self.action_min
         return actions.cpu().numpy()
 
 
-def build_model() -> IcedTeaPolicy:
-    return IcedTeaPolicy()
+def build_model(chunk_size: int = 4) -> IcedTeaPolicy:
+    return IcedTeaPolicy(chunk_size)
 
 
 def calculate_evaluation_mse(results: list[dict]) -> dict:
@@ -280,7 +293,11 @@ def run_evaluation(args) -> Path:
     dataset = build_dataset()
     if args.max_episodes is not None:
         dataset = Dataset(dataset.episodes[: args.max_episodes], name=dataset.name)
-    model = build_model()
+    model = build_model(args.chunk_size)
+    print(
+        f"Evaluation execution steps={model.chunk_size}; prediction horizon={model.horizon}",
+        flush=True,
+    )
 
     if args.output is None:
         output = (
