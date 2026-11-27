@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ from jepa_policy.datasets.icedtea_dataset import (
     IcedTeaDataset,
     IcedTeaDatasetConfig,
 )
+from jepa_policy.temporal_ensemble import ActTemporalEnsembler
 
 TRAIN_OUTPUT: Path | None = None
 TEST_DATASET: Path | None = None
@@ -58,8 +60,24 @@ def parse_arguments() -> argparse.Namespace:
         default=4,
         help="Actions executed before the next inference; prediction horizon stays 10",
     )
+    parser.add_argument(
+        "--temporal-ensemble",
+        action="store_true",
+        help="ACT temporal ensembling; requires --chunk-size 1",
+    )
+    parser.add_argument(
+        "--temporal-ensemble-k",
+        type=float,
+        default=0.01,
+        help="ACT exponential weight coefficient; oldest prediction has rank zero",
+    )
     parser.add_argument("--device", default="cuda:0")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.temporal_ensemble and args.chunk_size != 1:
+        parser.error("--temporal-ensemble requires --chunk-size 1")
+    if not np.isfinite(args.temporal_ensemble_k) or args.temporal_ensemble_k < 0:
+        parser.error("--temporal-ensemble-k must be finite and nonnegative")
+    return args
 
 
 def configure(args) -> None:
@@ -186,7 +204,12 @@ def build_dataset() -> Dataset:
 class IcedTeaPolicy:
     """Wrap the trained policy in model_eval's chunk prediction interface."""
 
-    def __init__(self, chunk_size: int = 4):
+    def __init__(
+        self,
+        chunk_size: int = 4,
+        temporal_ensemble: bool = False,
+        temporal_ensemble_k: float = 0.01,
+    ):
         if (
             TRAIN_OUTPUT is None
             or TEST_DATASET is None
@@ -206,13 +229,27 @@ class IcedTeaPolicy:
         max_chunk_size = self.horizon - self.action_start
         if not 1 <= chunk_size <= max_chunk_size:
             raise ValueError(f"chunk-size must be between 1 and {max_chunk_size}")
+        if temporal_ensemble and chunk_size != 1:
+            raise ValueError("ACT temporal ensembling requires chunk-size 1")
+        if not np.isfinite(temporal_ensemble_k) or temporal_ensemble_k < 0:
+            raise ValueError("temporal-ensemble-k must be finite and nonnegative")
         self.chunk_size = chunk_size
+        self.temporal_ensemble_k = temporal_ensemble_k
+        self.temporal_ensembler = (
+            ActTemporalEnsembler(max_chunk_size, 8, temporal_ensemble_k)
+            if temporal_ensemble
+            else None
+        )
         action_stats = TRAINING_STATS["features"]["action"]
         self.action_min = torch.as_tensor(action_stats["min"], device=DEVICE)
         self.action_range = torch.as_tensor(action_stats["range"], device=DEVICE)
         self.agent = TrainingAgent(config)
         self.agent.load(str(CHECKPOINT), load_optimizer=False)
         self.agent.eval()
+
+    def reset_episode(self) -> None:
+        if self.temporal_ensembler is not None:
+            self.temporal_ensembler.reset()
 
     def predict(self, observation: dict[str, torch.Tensor]) -> np.ndarray:
         inputs = {}
@@ -232,15 +269,27 @@ class IcedTeaPolicy:
                 use_ema=True,
                 return_future=True,
             )
+        prediction_steps = (
+            self.horizon - self.action_start
+            if self.temporal_ensembler is not None
+            else self.chunk_size
+        )
         executed_chunk = normalized[
-            0, self.action_start : self.action_start + self.chunk_size
+            0, self.action_start : self.action_start + prediction_steps
         ]
         actions = (executed_chunk + 1.0) * self.action_range / 2.0 + self.action_min
-        return actions.cpu().numpy()
+        raw_actions = actions.cpu().numpy()
+        if self.temporal_ensembler is not None:
+            return self.temporal_ensembler.update(raw_actions)[None, :]
+        return raw_actions
 
 
-def build_model(chunk_size: int = 4) -> IcedTeaPolicy:
-    return IcedTeaPolicy(chunk_size)
+def build_model(
+    chunk_size: int = 4,
+    temporal_ensemble: bool = False,
+    temporal_ensemble_k: float = 0.01,
+) -> IcedTeaPolicy:
+    return IcedTeaPolicy(chunk_size, temporal_ensemble, temporal_ensemble_k)
 
 
 def calculate_evaluation_mse(results: list[dict]) -> dict:
@@ -285,6 +334,49 @@ def print_evaluation_mse(metrics: dict) -> None:
     )
 
 
+def write_evaluation_config(
+    output: Path, model: IcedTeaPolicy, dataset: Dataset
+) -> None:
+    output.mkdir(parents=True, exist_ok=True)
+    stats_path = TRAIN_OUTPUT / "normalization_stats.json"
+    smoothing_enabled = model.temporal_ensembler is not None
+    retained_steps = (
+        model.horizon - model.action_start if smoothing_enabled else model.chunk_size
+    )
+    metadata = {
+        "checkpoint": str(CHECKPOINT.resolve()),
+        "dataset": str(TEST_DATASET.resolve()),
+        "episode_ids": [episode.episode_id for episode in dataset.episodes],
+        "chunk_size": model.chunk_size,
+        "prediction_horizon": model.horizon,
+        "action_start": model.action_start,
+        "raw_prediction_slice": [
+            model.action_start,
+            model.action_start + retained_steps,
+        ],
+        "normalization_file": str(stats_path),
+        "normalization_sha256": hashlib.sha256(stats_path.read_bytes()).hexdigest(),
+        "evaluator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "temporal_ensemble": {
+            "enabled": smoothing_enabled,
+            "mode": "act_temporal_ensemble" if smoothing_enabled else "disabled",
+            "execution_steps": model.chunk_size,
+            "retained_prediction_steps": retained_steps,
+            "candidate_chunks": "all_predictions_covering_current_timestep",
+            "reference": "raw_predictions_aligned_to_current_timestep",
+            "decay": model.temporal_ensemble_k,
+            "weight_order": "oldest_to_newest",
+            "weight_formula": "exp(-decay * prediction_rank)",
+            "query_every_steps": model.chunk_size,
+            "reset_each_episode": True,
+            "valid_zero_actions": True,
+        },
+    }
+    with (output / "evaluation_config.json").open("x", encoding="utf-8") as stream:
+        json.dump(metadata, stream, indent=2, ensure_ascii=False)
+        stream.write("\n")
+
+
 def run_evaluation(args) -> Path:
     if args.max_episodes is not None and args.max_episodes <= 0:
         raise ValueError("--max-episodes must be positive")
@@ -293,9 +385,12 @@ def run_evaluation(args) -> Path:
     dataset = build_dataset()
     if args.max_episodes is not None:
         dataset = Dataset(dataset.episodes[: args.max_episodes], name=dataset.name)
-    model = build_model(args.chunk_size)
+    model = build_model(
+        args.chunk_size, args.temporal_ensemble, args.temporal_ensemble_k
+    )
     print(
-        f"Evaluation execution steps={model.chunk_size}; prediction horizon={model.horizon}",
+        f"Evaluation execution steps={model.chunk_size}; prediction horizon={model.horizon}; "
+        f"ACT temporal ensemble={args.temporal_ensemble}; k={args.temporal_ensemble_k}",
         flush=True,
     )
 
@@ -309,6 +404,7 @@ def run_evaluation(args) -> Path:
         output.mkdir(parents=True, exist_ok=False)
     else:
         output = args.output
+    write_evaluation_config(output, model, dataset)
     artifact_dir = output / "artifacts"
     figure_dir = output / "figures"
     results = evaluate(model, dataset, artifact_dir)

@@ -72,6 +72,7 @@ def evaluate(model, dataset, out_dir, *, stride=None, on_error="fail", log=print
     Each call predicts ``[chunk_size, D]``. Predictions are copied onto the
     episode timeline; overlapping regions use the latest prediction chunk.
     A stride larger than the chunk is rejected because it leaves frame gaps.
+    Models exposing reset_episode() are reset before each episode.
     """
     chunk = _check_model(model)
     if not isinstance(dataset, Dataset):
@@ -90,6 +91,9 @@ def evaluate(model, dataset, out_dir, *, stride=None, on_error="fail", log=print
     for episode in dataset.episodes:
         started = time.perf_counter()
         try:
+            reset_episode = getattr(model, "reset_episode", None)
+            if reset_episode is not None:
+                reset_episode()
             results.append(_run_one(model, episode, chunk, step, out_dir))
         except Exception as exc:  # noqa: BLE001
             if on_error == "skip":
