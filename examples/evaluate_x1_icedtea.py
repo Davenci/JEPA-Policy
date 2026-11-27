@@ -230,6 +230,48 @@ def build_model() -> IcedTeaPolicy:
     return IcedTeaPolicy()
 
 
+def calculate_evaluation_mse(results: list[dict]) -> dict:
+    squared_error_sum = np.zeros(8, dtype=np.float64)
+    frame_count = 0
+    for result in results:
+        with np.load(result["path"], allow_pickle=False) as artifact:
+            prediction = artifact["prediction"].astype(np.float64)
+            ground_truth = artifact["ground_truth"].astype(np.float64)
+        if (
+            prediction.ndim != 2
+            or prediction.shape != ground_truth.shape
+            or prediction.shape[1] != 8
+        ):
+            raise ValueError(
+                f"Expected aligned [frames, 8] arrays in {result['path']}; "
+                f"got prediction={prediction.shape}, ground_truth={ground_truth.shape}"
+            )
+        squared_error_sum += np.square(prediction - ground_truth).sum(axis=0)
+        frame_count += prediction.shape[0]
+    if frame_count == 0:
+        raise ValueError("Cannot calculate MSE without evaluated frames")
+    per_dimension_mse = squared_error_sum / frame_count
+    joint_mse_sum = float(per_dimension_mse[:7].sum())
+    return {
+        "frames": frame_count,
+        "joint_mse_sum": joint_mse_sum,
+        "joint_mse_mean": joint_mse_sum / 7.0,
+        "gripper_mse": float(per_dimension_mse[7]),
+        "per_dimension_mse": per_dimension_mse.tolist(),
+    }
+
+
+def print_evaluation_mse(metrics: dict) -> None:
+    print(
+        "逐帧加权均方误差（原始动作单位）\n"
+        f"评估帧数={metrics['frames']}\n"
+        f"七关节MSE之和={metrics['joint_mse_sum']:.8f}\n"
+        f"七关节MSE均值={metrics['joint_mse_mean']:.8f}\n"
+        f"夹爪MSE={metrics['gripper_mse']:.8f}",
+        flush=True,
+    )
+
+
 def run_evaluation(args) -> Path:
     if args.max_episodes is not None and args.max_episodes <= 0:
         raise ValueError("--max-episodes must be positive")
@@ -262,6 +304,7 @@ def run_evaluation(args) -> Path:
                 data_root=dataset.name,
                 checkpoint=str(CHECKPOINT),
             )
+    print_evaluation_mse(calculate_evaluation_mse(results))
     print(f"Evaluated {len(results)} episodes; results: {output}", flush=True)
     return output
 
