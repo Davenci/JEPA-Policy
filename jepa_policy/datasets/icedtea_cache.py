@@ -34,24 +34,15 @@ CACHE_FIELDS = {
 
 
 class IcedTeaSampleSource(SampleSource):
-    def __init__(
-        self, dataset_path: str, obs_steps: int, horizon: int, future_steps: int
-    ):
-        self.dataset = IcedTeaDataset(
-            IcedTeaDatasetConfig(
-                root=Path(dataset_path),
-                obs_steps=obs_steps,
-                horizon=horizon,
-                future_steps=future_steps,
-            )
-        )
+    def __init__(self, config: IcedTeaDatasetConfig):
+        self.dataset = IcedTeaDataset(config)
         self._digest = hashlib.sha256(
             json.dumps(
                 {
                     "samples": self.dataset.samples,
-                    "obs_steps": obs_steps,
-                    "horizon": horizon,
-                    "future_steps": future_steps,
+                    "obs_steps": config.obs_steps,
+                    "horizon": config.horizon,
+                    "future_steps": config.future_steps,
                     "task": self.dataset.task_name,
                 },
                 separators=(",", ":"),
@@ -86,8 +77,8 @@ class IcedTeaSampleSource(SampleSource):
         return sample if fields is None else {key: sample[key] for key in fields}
 
 
-def create_source(dataset_path: str, obs_steps: int, horizon: int, future_steps: int):
-    return IcedTeaSampleSource(dataset_path, obs_steps, horizon, future_steps)
+def create_source(config: IcedTeaDatasetConfig):
+    return IcedTeaSampleSource(config)
 
 
 def build_icedtea_cache(
@@ -105,22 +96,26 @@ def build_icedtea_cache(
         "fields": CACHE_FIELDS,
         "version": 1,
     }
-    source = IcedTeaSampleSource(
-        str(dataset.root), dataset.obs_steps, dataset.horizon, dataset.future_steps
+    dataset_config = IcedTeaDatasetConfig(
+        root=dataset.root,
+        obs_steps=dataset.obs_steps,
+        horizon=dataset.horizon,
+        future_steps=dataset.future_steps,
+        task_name=dataset.task_name,
+        image_size=dataset.image_size,
+        image_interpolation=dataset.image_interpolation,
+        episode_indices=dataset.selected_episode_indices,
     )
+    config["episode_indices"] = dataset.selected_episode_indices
+    config["image_interpolation"] = dataset.image_interpolation
+    source = IcedTeaSampleSource(dataset_config)
     cache = StepSampleCache(
         source,
         dataset_path=dataset.root,
         source_config=config,
         root=cache_root,
         frames_per_shard=1024,
-        source_factory=partial(
-            create_source,
-            str(dataset.root),
-            dataset.obs_steps,
-            dataset.horizon,
-            dataset.future_steps,
-        ),
+        source_factory=partial(create_source, dataset_config),
         cache_build_workers=cache_build_workers,
         write_concurrency=cache_build_workers,
     )

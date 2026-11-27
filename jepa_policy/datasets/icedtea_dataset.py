@@ -33,6 +33,9 @@ class IcedTeaDatasetConfig:
     future_steps: int = 4
     task_name: str = TASK_NAME
     image_size: int = 128
+    image_interpolation: int = cv2.INTER_LINEAR
+    normalize: bool = True
+    episode_indices: tuple[int, ...] | None = None
 
 
 def initialize_icedtea_worker(worker_id: int) -> None:
@@ -51,9 +54,12 @@ class IcedTeaDataset(Dataset):
         self.future_steps = config.future_steps
         self.task_name = config.task_name
         self.image_size = config.image_size
+        self.image_interpolation = config.image_interpolation
+        self.normalize = config.normalize
+        self.selected_episode_indices = config.episode_indices
         self.task_index = self.find_task_index()
-        self.load_frames()
         self.episodes = self.load_episodes()
+        self.load_frames()
         self.containers = OrderedDict()
         self.frame_cache = OrderedDict()
         self.samples = self.make_sample_indices()
@@ -91,10 +97,18 @@ class IcedTeaDataset(Dataset):
         self.timestamps = np.asarray(table["timestamp"].to_numpy(), dtype=np.float64)
         self.episode_ids = np.asarray(table["episode_index"].to_numpy(), dtype=np.int64)
         self.task_indices = np.asarray(table["task_index"].to_numpy(), dtype=np.int64)
-        self.normalize_frames()
+        self.raw_actions = self.actions.copy()
+        self.raw_states = self.states.copy()
+        if self.normalize:
+            self.normalize_frames()
+        else:
+            self.actions = self.raw_actions.copy()
+            self.states = self.raw_states.copy()
 
     def normalize_frames(self) -> None:
-        task_mask = self.task_indices == self.task_index
+        task_mask = (self.task_indices == self.task_index) & np.isin(
+            self.episode_ids, tuple(self.episodes)
+        )
         self.action_min = self.actions[task_mask].min(axis=0)
         self.action_range = np.maximum(
             self.actions[task_mask].max(axis=0) - self.action_min, 1e-6
@@ -111,7 +125,30 @@ class IcedTeaDataset(Dataset):
         paths = sorted((self.root / "meta/episodes").glob("chunk-*/*.parquet"))
         for path in paths:
             records.extend(pq.read_table(path).to_pylist())
-        return {int(record["episode_index"]): record for record in records}
+        episodes = {int(record["episode_index"]): record for record in records}
+        if self.selected_episode_indices is None:
+            return episodes
+        if not self.selected_episode_indices:
+            raise ValueError("episode_indices must contain at least one episode")
+        selected_ids = set(self.selected_episode_indices)
+        if len(selected_ids) != len(self.selected_episode_indices):
+            raise ValueError("episode_indices contains duplicate episode indices")
+        missing_ids = sorted(selected_ids - episodes.keys())
+        if missing_ids:
+            raise ValueError(f"Episode indices not found in dataset: {missing_ids}")
+        wrong_task_ids = [
+            episode_id
+            for episode_id in self.selected_episode_indices
+            if self.task_name not in episodes[episode_id]["tasks"]
+        ]
+        if wrong_task_ids:
+            raise ValueError(
+                f"Episodes do not contain task {self.task_name!r}: {wrong_task_ids}"
+            )
+        return {
+            episode_id: episodes[episode_id]
+            for episode_id in self.selected_episode_indices
+        }
 
     def make_sample_indices(self) -> list[tuple[int, int]]:
         samples = []
@@ -169,7 +206,9 @@ class IcedTeaDataset(Dataset):
         if selected is None:
             raise RuntimeError(f"No frame at {timestamp:.3f}s in {path}")
         image = cv2.resize(
-            selected.to_ndarray(format="rgb24"), (self.image_size, self.image_size)
+            selected.to_ndarray(format="rgb24"),
+            (self.image_size, self.image_size),
+            interpolation=self.image_interpolation,
         )
         image = torch.from_numpy(np.moveaxis(image, -1, 0).copy())
         self.frame_cache[cache_key] = image

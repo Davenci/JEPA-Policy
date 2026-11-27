@@ -5,11 +5,15 @@ from __future__ import annotations
 import argparse
 import faulthandler
 import json
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "rolling_cache"))
 
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -87,6 +91,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--save-every", type=int, default=5000)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--episode-indices", type=Path)
     parser.add_argument(
         "--cache-root", type=Path, default=Path("/tmp/jepa_icedtea_cache")
     )
@@ -276,9 +281,48 @@ def prepare_run_directory(
         "state_min": dataset.state_min.tolist(),
         "state_range": dataset.state_range.tolist(),
         "dataset": str(dataset.root),
+        "episode_indices": sorted({episode_id for _, episode_id in dataset.samples}),
     }
     (output_path / "dataset_metadata.json").write_text(
         json.dumps(metadata, indent=2) + "\n"
+    )
+    action_min = dataset.action_min.astype(float)
+    action_range = dataset.action_range.astype(float)
+    state_min = dataset.state_min.astype(float)
+    state_range = dataset.state_range.astype(float)
+    normalization_stats = {
+        "schema_version": 1,
+        "task": dataset.task_name,
+        "dataset": str(dataset.root),
+        "normalization": "per_task_min_max_to_minus1_plus1",
+        "episode_indices": metadata["episode_indices"],
+        "features": {
+            "action": {
+                "names": ACTION_NAMES,
+                "min": action_min.tolist(),
+                "max": (action_min + action_range).tolist(),
+                "range": action_range.tolist(),
+            },
+            "observation.state": {
+                "names": ACTION_NAMES,
+                "min": state_min.tolist(),
+                "max": (state_min + state_range).tolist(),
+                "range": state_range.tolist(),
+            },
+        },
+        "image_preprocessing": {
+            "source_pixel_type": "uint8_rgb",
+            "resize_shape": [dataset.image_size, dataset.image_size],
+            "resize_interpolation": dataset.image_interpolation,
+            "crop_shape": [112, 112],
+            "training_crop_mode": "temporal_consistent_random",
+            "evaluation_crop_mode": "center",
+            "imagenet_normalization": False,
+            "pixel_mapping": "uint8_to_0_1_then_minus1_to_plus1",
+        },
+    }
+    (output_path / "normalization_stats.json").write_text(
+        json.dumps(normalization_stats, indent=2) + "\n"
     )
     return model_dir, metrics_path
 
@@ -386,6 +430,11 @@ def main() -> None:
             obs_steps=config.task.obs_steps,
             horizon=config.task.horizon,
             future_steps=config.task.future_state_steps,
+            episode_indices=(
+                tuple(json.loads(args.episode_indices.read_text()))
+                if args.episode_indices is not None
+                else None
+            ),
         )
     )
     print(

@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "rolling_cache"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "model_eval"))
+
+import cv2
 import numpy as np
 import pyarrow.parquet as pq
 import torch
@@ -26,8 +32,10 @@ from jepa_policy.datasets.icedtea_dataset import (
 TRAIN_OUTPUT: Path | None = None
 TEST_DATASET: Path | None = None
 CHECKPOINT: Path | None = None
+TRAINING_STATS: dict | None = None
 DEVICE = "cuda:0"
 TEST_TASK_NAME: str | None = None
+test_episode_indices: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -42,6 +50,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--max-episodes", type=int)
+    parser.add_argument("--episode-indices", type=Path)
     parser.add_argument("--task-name")
     parser.add_argument("--device", default="cuda:0")
     return parser.parse_args()
@@ -69,40 +78,59 @@ def resolve_task_name(
 
 
 def configure(args) -> None:
-    global TRAIN_OUTPUT, TEST_DATASET, CHECKPOINT, DEVICE, TEST_TASK_NAME
+    global \
+        TRAIN_OUTPUT, \
+        TEST_DATASET, \
+        CHECKPOINT, \
+        TRAINING_STATS, \
+        DEVICE, \
+        TEST_TASK_NAME, \
+        test_episode_indices
 
     TEST_DATASET = Path(getattr(args, "dataset", None) or args.data_root)
     CHECKPOINT = Path(args.checkpoint)
     TRAIN_OUTPUT = CHECKPOINT.parent.parent
     DEVICE = getattr(args, "device", "cuda:0")
+    indices_path = getattr(args, "episode_indices", None)
+    test_episode_indices = (
+        tuple(json.loads(Path(indices_path).read_text()))
+        if indices_path is not None
+        else None
+    )
 
-    metadata_path = TRAIN_OUTPUT / "dataset_metadata.json"
-    for path in (metadata_path, TEST_DATASET / "meta/info.json", CHECKPOINT):
+    stats_path = TRAIN_OUTPUT / "normalization_stats.json"
+    for path in (stats_path, TEST_DATASET / "meta/info.json", CHECKPOINT):
         if not path.is_file():
             raise FileNotFoundError(path)
 
-    metadata = json.loads(metadata_path.read_text())
+    TRAINING_STATS = json.loads(stats_path.read_text())
+    if TRAINING_STATS["schema_version"] != 1:
+        raise ValueError(f"Unsupported normalization stats schema: {stats_path}")
+    interpolation = TRAINING_STATS["image_preprocessing"]["resize_interpolation"]
+    if interpolation != cv2.INTER_LINEAR:
+        raise ValueError(
+            "Evaluation image resize interpolation differs from the training "
+            f"pipeline: {interpolation} != INTER_LINEAR ({cv2.INTER_LINEAR})"
+        )
     TEST_TASK_NAME = resolve_task_name(
         TEST_DATASET,
-        metadata["task"],
+        TRAINING_STATS["task"],
         getattr(args, "task_name", None),
     )
     print(f"Task: {TEST_TASK_NAME}", flush=True)
 
 
 def restore_raw_actions(source: IcedTeaDataset) -> np.ndarray:
-    return source.actions * (source.action_range / 2.0) + (
-        source.action_min + source.action_range / 2.0
-    )
+    return source.raw_actions.copy()
 
 
-def normalize_test_states(source: IcedTeaDataset, metadata: dict) -> np.ndarray:
-    states_raw = source.states * (source.state_range / 2.0) + (
-        source.state_min + source.state_range / 2.0
-    )
-    train_state_min = np.asarray(metadata["state_min"], dtype=np.float32)
-    train_state_range = np.asarray(metadata["state_range"], dtype=np.float32)
-    return (states_raw - train_state_min) / train_state_range * 2.0 - 1.0
+def normalize_test_states(source: IcedTeaDataset, stats: dict) -> np.ndarray:
+    states_raw = source.raw_states
+    state_stats = stats["features"]["observation.state"]
+    train_state_min = np.asarray(state_stats["min"], dtype=np.float32)
+    train_state_range = np.asarray(state_stats["range"], dtype=np.float32)
+    normalized = (states_raw - train_state_min) / train_state_range * 2.0 - 1.0
+    return normalized
 
 
 def create_episode(
@@ -120,21 +148,25 @@ def create_episode(
         *,
         current_record=record,
         frame_start=start,
-        length=episode_length,
     ):
-        row = frame_start + frame
-        next_row = frame_start + min(frame + 1, length - 1)
+        current_row = frame_start + frame
+        previous_row = frame_start + max(frame - 1, 0)
         observation = {
             camera: torch.stack(
                 [
-                    source.read_image(current_record, camera, row),
-                    source.read_image(current_record, camera, next_row),
+                    source.read_image(current_record, camera, previous_row),
+                    source.read_image(current_record, camera, current_row),
                 ]
             )
             for camera in CAMERAS
         }
         observation["agent_pos"] = torch.from_numpy(
-            frame_data.states_normalized[row : next_row + 1].copy()
+            np.stack(
+                [
+                    frame_data.states_normalized[previous_row],
+                    frame_data.states_normalized[current_row],
+                ]
+            )
         )
         return observation
 
@@ -148,15 +180,27 @@ def create_episode(
 
 
 def build_dataset() -> Dataset:
-    if TRAIN_OUTPUT is None or TEST_DATASET is None or TEST_TASK_NAME is None:
+    if (
+        TRAIN_OUTPUT is None
+        or TEST_DATASET is None
+        or TEST_TASK_NAME is None
+        or TRAINING_STATS is None
+    ):
         raise RuntimeError("Configure the evaluation paths before loading the dataset")
-    metadata = json.loads((TRAIN_OUTPUT / "dataset_metadata.json").read_text())
     source = IcedTeaDataset(
-        IcedTeaDatasetConfig(TEST_DATASET, task_name=TEST_TASK_NAME)
+        IcedTeaDatasetConfig(
+            TEST_DATASET,
+            task_name=TEST_TASK_NAME,
+            image_interpolation=TRAINING_STATS["image_preprocessing"][
+                "resize_interpolation"
+            ],
+            normalize=False,
+            episode_indices=test_episode_indices,
+        )
     )
     frame_data = NormalizedTestData(
         actions_raw=restore_raw_actions(source),
-        states_normalized=normalize_test_states(source, metadata),
+        states_normalized=normalize_test_states(source, TRAINING_STATS),
     )
     episodes = [
         create_episode(source, episode_id, record, frame_data)
@@ -171,21 +215,26 @@ def build_dataset() -> Dataset:
 class IcedTeaPolicy:
     """Wrap the trained policy in model_eval's chunk prediction interface."""
 
-    chunk_size = 10
+    chunk_size = 8
 
     def __init__(self):
-        if TRAIN_OUTPUT is None or TEST_DATASET is None or CHECKPOINT is None:
+        if (
+            TRAIN_OUTPUT is None
+            or TEST_DATASET is None
+            or CHECKPOINT is None
+            or TRAINING_STATS is None
+        ):
             raise RuntimeError(
                 "Configure the evaluation paths before loading the model"
             )
         if DEVICE.startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError(f"CUDA is unavailable for requested device {DEVICE}")
-        metadata = json.loads((TRAIN_OUTPUT / "dataset_metadata.json").read_text())
         optimization = create_optimization_config(steps=1, batch_size=1, workers=0)
         config = create_config(TEST_DATASET, TRAIN_OUTPUT, optimization)
         config.optimization.device = DEVICE
-        self.action_min = torch.as_tensor(metadata["action_min"], device=DEVICE)
-        self.action_range = torch.as_tensor(metadata["action_range"], device=DEVICE)
+        action_stats = TRAINING_STATS["features"]["action"]
+        self.action_min = torch.as_tensor(action_stats["min"], device=DEVICE)
+        self.action_range = torch.as_tensor(action_stats["range"], device=DEVICE)
         self.agent = TrainingAgent(config)
         self.agent.load(str(CHECKPOINT), load_optimizer=False)
         self.agent.eval()
@@ -199,7 +248,7 @@ class IcedTeaPolicy:
             else:
                 value = value.float()
             inputs[key] = value
-        initial_action = torch.zeros((1, self.chunk_size, 8), device=DEVICE)
+        initial_action = torch.zeros((1, 10, 8), device=DEVICE)
         with torch.inference_mode():
             normalized, _ = self.agent.sample(
                 act_0=initial_action,
@@ -208,7 +257,8 @@ class IcedTeaPolicy:
                 use_ema=True,
                 return_future=True,
             )
-        actions = (normalized[0] + 1.0) * self.action_range / 2.0 + self.action_min
+        executed_chunk = normalized[0, 1:9]
+        actions = (executed_chunk + 1.0) * self.action_range / 2.0 + self.action_min
         return actions.cpu().numpy()
 
 
