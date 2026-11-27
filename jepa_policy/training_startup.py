@@ -17,10 +17,7 @@ import cv2
 import torch
 
 from jepa_policy.datasets.icedtea_dataset import ACTION_NAMES, CAMERAS
-from jepa_policy.datasets.icedtea_selection_audit import (
-    build_selection_audit,
-    format_selection_audit,
-)
+from jepa_policy.datasets.icedtea_selection_audit import build_selection_audit
 from jepa_policy.training_logging import describe_batch_tensors, log_section
 
 
@@ -58,6 +55,12 @@ def collect_code_info(root: Path) -> dict:
         "jepa_policy/datasets/icedtea_selection_audit.py",
         "jepa_policy/training_startup.py",
         "jepa_policy/training_logging.py",
+        "jepa_policy/training_artifacts.py",
+        "jepa_policy/training_monitor.py",
+        "jepa_policy/icedtea_training_arguments.py",
+        "jepa_policy/checkpoint_evaluation.py",
+        "jepa_policy/datasets/icedtea_split.py",
+        "jepa_policy/mlflow_tracking.py",
     )
     hashes = {
         name: hashlib.sha256((root / name).read_bytes()).hexdigest()
@@ -102,9 +105,7 @@ def collect_normalization_info(dataset, output: Path) -> dict:
     }
 
 
-def build_training_summary(config, dataset, args) -> dict:
-    output = Path(args.output).resolve()
-    batch_size = config.optimization.batch_size
+def collect_training_arguments(args) -> dict:
     argument_names = (
         "dataset",
         "output",
@@ -118,17 +119,30 @@ def build_training_summary(config, dataset, args) -> dict:
         "cache_build_workers",
         "device",
         "log_every",
+        "split_seed",
+        "eval_batch_size",
+        "eval_chunk_size",
+        "eval_seed",
+        "mlflow",
+        "mlflow_tracking_uri",
+        "mlflow_experiment",
+        "mlflow_run_name",
     )
-    arguments = {
+    return {
         name: str(value) if isinstance(value, Path) else value
         for name in argument_names
         if (value := vars(args)[name]) is not None
     }
+
+
+def build_training_summary(config, dataset, args) -> dict:
+    output = Path(args.output).resolve()
+    batch_size = config.optimization.batch_size
     return {
         "schema_version": 1,
         "started_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
         "output": str(output),
-        "arguments": arguments,
+        "arguments": collect_training_arguments(args),
         "code": collect_code_info(Path(__file__).resolve().parents[1]),
         "runtime": collect_runtime_info(config.optimization.device),
         "config": asdict(config),
@@ -274,7 +288,6 @@ def write_training_summary(summary: dict, output_path: Path) -> None:
     log_section(
         "设备与环境", [f"{name}={value}" for name, value in summary["runtime"].items()]
     )
-    log_section("数据筛选", format_selection_audit(summary["selection"])[1:])
     log_section("归一化统计", format_normalization(summary))
     for title, lines in format_hyperparameters(summary).items():
         log_section(title, lines)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import time
+import traceback
 from collections.abc import Callable
 from pathlib import Path
 
@@ -17,7 +18,9 @@ def format_log_record(record: dict) -> str:
     record["extra"]["body"] = "\n".join(
         "  " + line for line in record["message"].splitlines()
     )
+    separator = "-" * 72
     return (
+        f"\n{separator}\n"
         "{time:YYYY-MM-DD HH:mm:ss} | {level:<7} | {extra[section]}\n"
         "{extra[body]}\n{exception}"
     )
@@ -124,5 +127,7 @@ def run_logged_training(entrypoint: Callable[[], None]) -> None:
     try:
         entrypoint()
     except Exception:
-        logger.bind(section="训练失败").exception("训练已退出，错误堆栈如下")
+        logger.bind(section="训练失败").error(
+            "训练已退出，错误堆栈如下\n{}", traceback.format_exc()
+        )
         raise SystemExit(1) from None

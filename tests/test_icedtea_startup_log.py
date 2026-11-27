@@ -197,6 +197,14 @@ def summary_inputs(audit_dataset_root: Path, monkeypatch):
         cache_build_workers=8,
         device="cuda:0",
         log_every=20,
+        split_seed=0,
+        eval_batch_size=64,
+        eval_chunk_size=4,
+        eval_seed=12345,
+        mlflow=True,
+        mlflow_tracking_uri="https://mlflow.seer-robotics.cn",
+        mlflow_experiment="pretrain-fm",
+        mlflow_run_name=None,
     )
     optimization = create_optimization_config(args.steps, args.batch_size, args.workers)
     config = create_config(args.dataset, args.output, optimization)
@@ -419,3 +427,26 @@ def test_saved_statistics_include_selected_short_episodes(audit_dataset_root: Pa
     np.testing.assert_array_equal(
         statistics["features"]["action"]["range"], np.full(8, 203.0)
     )
+
+
+def test_failure_before_log_setup_never_renders_local_arguments(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    script = tmp_path / "early_failure.py"
+    script.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {str(root)!r})\n"
+        "from types import SimpleNamespace\n"
+        "from jepa_policy.training_logging import run_logged_training\n"
+        "def fail():\n"
+        "    args = SimpleNamespace(output='existing-output', "
+        "private_value='synthetic-private-marker')\n"
+        "    raise FileExistsError(args.output)\n"
+        "run_logged_training(fail)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 1
+    output = result.stdout + result.stderr
+    assert "FileExistsError: existing-output" in output
+    assert "synthetic-private-marker" not in output
